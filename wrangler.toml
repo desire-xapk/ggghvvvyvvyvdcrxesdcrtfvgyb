@@ -1,0 +1,15 @@
+name = "cosmic-chat-api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# KV Namespace binding - you need to create this
+# Run: wrangler kv:namespace create "COSMIC_KV"
+# Then paste the id below
+[[kv_namespaces]]
+binding = "COSMIC_KV"
+id = "YOUR_KV_NAMESPACE_ID_HERE"
+
+# For local development
+# Run: wrangler kv:namespace create "COSMIC_KV" --preview
+# Then paste the preview_id below
+# preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID_HERE"
