@@ -1,0 +1,454 @@
+// CosmicChat Cloudflare Worker Backend
+// Supports: Authentication, Messages, Presence, Real-time via SSE
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+// Helper: JSON Response
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+// Helper: Error Response
+function errorResponse(message, status = 400) {
+  return jsonResponse({ error: message }, status);
+}
+
+// Helper: Get user from auth header
+async function getAuthUser(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = authHeader.slice(7);
+  const session = await env.COSMIC_KV.get(`session:${token}`);
+  if (!session) return null;
+  return JSON.parse(session);
+}
+
+// Generate simple token
+function generateToken() {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  return Array.from(array, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Hash password (simple hash for demo - use proper hashing in production)
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password + 'cosmic_salt_2024');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // Handle CORS preflight
+    if (method === 'OPTIONS') {
+      return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    try {
+      // ==================== AUTH ROUTES ====================
+      
+      // Register
+      if (path === '/api/register' && method === 'POST') {
+        const { username, password } = await request.json();
+        
+        if (!username || !password) {
+          return errorResponse('Username and password required');
+        }
+        
+        const cleanUsername = username.trim().toLowerCase();
+        
+        if (cleanUsername.length < 3) {
+          return errorResponse('Username must be at least 3 characters');
+        }
+        
+        if (password.length < 4) {
+          return errorResponse('Password must be at least 4 characters');
+        }
+        
+        // Check if user exists
+        const existingUser = await env.COSMIC_KV.get(`user:${cleanUsername}`);
+        if (existingUser) {
+          return errorResponse('Username already taken');
+        }
+        
+        // Create user
+        const hashedPassword = await hashPassword(password);
+        const user = {
+          username: cleanUsername,
+          password: hashedPassword,
+          createdAt: Date.now(),
+        };
+        
+        await env.COSMIC_KV.put(`user:${cleanUsername}`, JSON.stringify(user));
+        
+        // Add to users list
+        let usersList = JSON.parse(await env.COSMIC_KV.get('users_list') || '[]');
+        usersList.push(cleanUsername);
+        await env.COSMIC_KV.put('users_list', JSON.stringify(usersList));
+        
+        // Create session
+        const token = generateToken();
+        await env.COSMIC_KV.put(`session:${token}`, JSON.stringify({ username: cleanUsername }), { expirationTtl: 86400 * 7 });
+        
+        return jsonResponse({ success: true, token, username: cleanUsername });
+      }
+      
+      // Login
+      if (path === '/api/login' && method === 'POST') {
+        const { username, password } = await request.json();
+        
+        if (!username || !password) {
+          return errorResponse('Username and password required');
+        }
+        
+        const cleanUsername = username.trim().toLowerCase();
+        const userJson = await env.COSMIC_KV.get(`user:${cleanUsername}`);
+        
+        if (!userJson) {
+          return errorResponse('User not found');
+        }
+        
+        const user = JSON.parse(userJson);
+        const hashedPassword = await hashPassword(password);
+        
+        if (user.password !== hashedPassword) {
+          return errorResponse('Incorrect password');
+        }
+        
+        // Create session
+        const token = generateToken();
+        await env.COSMIC_KV.put(`session:${token}`, JSON.stringify({ username: cleanUsername }), { expirationTtl: 86400 * 7 });
+        
+        return jsonResponse({ success: true, token, username: cleanUsername });
+      }
+      
+      // Logout
+      if (path === '/api/logout' && method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const token = authHeader.slice(7);
+          await env.COSMIC_KV.delete(`session:${token}`);
+        }
+        return jsonResponse({ success: true });
+      }
+      
+      // Verify token
+      if (path === '/api/verify' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Invalid token', 401);
+        }
+        return jsonResponse({ success: true, username: user.username });
+      }
+      
+      // ==================== USERS ROUTES ====================
+      
+      // Get all users
+      if (path === '/api/users' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const usersList = JSON.parse(await env.COSMIC_KV.get('users_list') || '[]');
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        const now = Date.now();
+        
+        const users = usersList
+          .filter(u => u !== user.username)
+          .map(u => ({
+            username: u,
+            online: presence[u] && (now - presence[u] < 15000),
+          }));
+        
+        return jsonResponse({ users });
+      }
+      
+      // ==================== PRESENCE ROUTES ====================
+      
+      // Update presence (heartbeat)
+      if (path === '/api/presence' && method === 'POST') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        presence[user.username] = Date.now();
+        
+        // Clean old presence (older than 30 seconds)
+        const now = Date.now();
+        for (const key in presence) {
+          if (now - presence[key] > 30000) {
+            delete presence[key];
+          }
+        }
+        
+        await env.COSMIC_KV.put('presence', JSON.stringify(presence));
+        
+        return jsonResponse({ success: true, presence });
+      }
+      
+      // Get presence
+      if (path === '/api/presence' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        return jsonResponse({ presence });
+      }
+      
+      // ==================== MESSAGES ROUTES ====================
+      
+      // Send message
+      if (path === '/api/messages' && method === 'POST') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const { to, text } = await request.json();
+        
+        if (!to || !text) {
+          return errorResponse('Recipient and text required');
+        }
+        
+        // Check recipient exists
+        const recipientExists = await env.COSMIC_KV.get(`user:${to}`);
+        if (!recipientExists) {
+          return errorResponse('Recipient not found');
+        }
+        
+        const message = {
+          id: `${Date.now()}_${generateToken().slice(0, 8)}`,
+          from: user.username,
+          to: to,
+          text: text.trim(),
+          timestamp: Date.now(),
+          read: false,
+        };
+        
+        // Store message in both users' message lists
+        const chatId = [user.username, to].sort().join('_');
+        let messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
+        messages.push(message);
+        
+        // Keep only last 500 messages per chat
+        if (messages.length > 500) {
+          messages = messages.slice(-500);
+        }
+        
+        await env.COSMIC_KV.put(`chat:${chatId}`, JSON.stringify(messages));
+        
+        // Update chat lists for both users
+        await updateChatList(env, user.username, to, message);
+        await updateChatList(env, to, user.username, message);
+        
+        return jsonResponse({ success: true, message });
+      }
+      
+      // Get messages with a specific user
+      if (path.startsWith('/api/messages/') && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const otherUser = path.split('/api/messages/')[1];
+        const chatId = [user.username, otherUser].sort().join('_');
+        const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
+        
+        // Mark messages as read
+        let updated = false;
+        messages.forEach(m => {
+          if (m.to === user.username && !m.read) {
+            m.read = true;
+            updated = true;
+          }
+        });
+        
+        if (updated) {
+          await env.COSMIC_KV.put(`chat:${chatId}`, JSON.stringify(messages));
+        }
+        
+        return jsonResponse({ messages });
+      }
+      
+      // Get all chats
+      if (path === '/api/chats' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const chatList = JSON.parse(await env.COSMIC_KV.get(`chatlist:${user.username}`) || '[]');
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        const now = Date.now();
+        
+        // Add online status and count unread
+        const chatsWithStatus = await Promise.all(chatList.map(async (chat) => {
+          const chatId = [user.username, chat.user].sort().join('_');
+          const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
+          const unread = messages.filter(m => m.to === user.username && !m.read).length;
+          
+          return {
+            ...chat,
+            online: presence[chat.user] && (now - presence[chat.user] < 15000),
+            unread,
+          };
+        }));
+        
+        return jsonResponse({ chats: chatsWithStatus });
+      }
+      
+      // Mark messages as read
+      if (path === '/api/messages/read' && method === 'POST') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const { otherUser } = await request.json();
+        const chatId = [user.username, otherUser].sort().join('_');
+        const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
+        
+        messages.forEach(m => {
+          if (m.to === user.username) {
+            m.read = true;
+          }
+        });
+        
+        await env.COSMIC_KV.put(`chat:${chatId}`, JSON.stringify(messages));
+        
+        return jsonResponse({ success: true });
+      }
+      
+      // ==================== POLLING FOR NEW MESSAGES ====================
+      
+      // Poll for updates (simple polling endpoint)
+      if (path === '/api/poll' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const since = parseInt(url.searchParams.get('since') || '0');
+        const chatWith = url.searchParams.get('with');
+        
+        let newMessages = [];
+        
+        if (chatWith) {
+          const chatId = [user.username, chatWith].sort().join('_');
+          const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
+          newMessages = messages.filter(m => m.timestamp > since);
+        }
+        
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        
+        return jsonResponse({ 
+          messages: newMessages,
+          presence,
+          timestamp: Date.now()
+        });
+      }
+      
+      // ==================== TYPING INDICATOR ====================
+      
+      // Set typing status
+      if (path === '/api/typing' && method === 'POST') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const { to, typing } = await request.json();
+        
+        const typingData = JSON.parse(await env.COSMIC_KV.get('typing') || '{}');
+        const key = `${user.username}_${to}`;
+        
+        if (typing) {
+          typingData[key] = Date.now();
+        } else {
+          delete typingData[key];
+        }
+        
+        // Clean old typing indicators (older than 5 seconds)
+        const now = Date.now();
+        for (const k in typingData) {
+          if (now - typingData[k] > 5000) {
+            delete typingData[k];
+          }
+        }
+        
+        await env.COSMIC_KV.put('typing', JSON.stringify(typingData));
+        
+        return jsonResponse({ success: true });
+      }
+      
+      // Get typing status
+      if (path === '/api/typing' && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const from = url.searchParams.get('from');
+        const typingData = JSON.parse(await env.COSMIC_KV.get('typing') || '{}');
+        const key = `${from}_${user.username}`;
+        
+        const isTyping = typingData[key] && (Date.now() - typingData[key] < 5000);
+        
+        return jsonResponse({ typing: isTyping });
+      }
+      
+      // Default: Not found
+      return errorResponse('Not found', 404);
+      
+    } catch (error) {
+      console.error('Error:', error);
+      return errorResponse('Internal server error: ' + error.message, 500);
+    }
+  },
+};
+
+// Helper: Update chat list for a user
+async function updateChatList(env, username, otherUser, message) {
+  let chatList = JSON.parse(await env.COSMIC_KV.get(`chatlist:${username}`) || '[]');
+  
+  // Remove existing entry for this user
+  chatList = chatList.filter(c => c.user !== otherUser);
+  
+  // Add to top
+  chatList.unshift({
+    user: otherUser,
+    lastMessage: message.text,
+    timestamp: message.timestamp,
+  });
+  
+  // Keep only 50 chats
+  if (chatList.length > 50) {
+    chatList = chatList.slice(0, 50);
+  }
+  
+  await env.COSMIC_KV.put(`chatlist:${username}`, JSON.stringify(chatList));
+}
