@@ -1,5 +1,5 @@
 // CosmicChat Cloudflare Worker Backend
-// Supports: Authentication, Messages, Presence, Real-time via SSE
+// Supports: Authentication, Messages, Presence, Profiles, Avatars
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -7,6 +7,12 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Max-Age': '86400',
 };
+
+// Username validation: 4-10 chars, English letters and _, can't start with digit
+function isValidUsername(username) {
+  const regex = /^[a-zA-Z_][a-zA-Z0-9_]{3,9}$/;
+  return regex.test(username);
+}
 
 // Helper: JSON Response
 function jsonResponse(data, status = 200) {
@@ -67,7 +73,7 @@ export default {
       
       // Register
       if (path === '/api/register' && method === 'POST') {
-        const { username, password } = await request.json();
+        const { username, password, nickname } = await request.json();
         
         if (!username || !password) {
           return errorResponse('Username and password required');
@@ -75,8 +81,9 @@ export default {
         
         const cleanUsername = username.trim().toLowerCase();
         
-        if (cleanUsername.length < 3) {
-          return errorResponse('Username must be at least 3 characters');
+        // Validate username format
+        if (!isValidUsername(cleanUsername)) {
+          return errorResponse('Username must be 4-10 characters, English letters and _ only, cannot start with a number');
         }
         
         if (password.length < 4) {
@@ -86,7 +93,7 @@ export default {
         // Check if user exists
         const existingUser = await env.COSMIC_KV.get(`user:${cleanUsername}`);
         if (existingUser) {
-          return errorResponse('Username already taken');
+          return errorResponse('Username @' + cleanUsername + ' is already taken');
         }
         
         // Create user
@@ -94,10 +101,22 @@ export default {
         const user = {
           username: cleanUsername,
           password: hashedPassword,
+          nickname: nickname || cleanUsername,
           createdAt: Date.now(),
         };
         
         await env.COSMIC_KV.put(`user:${cleanUsername}`, JSON.stringify(user));
+        
+        // Create default profile
+        const profile = {
+          username: cleanUsername,
+          nickname: nickname || cleanUsername,
+          status: '',
+          avatarColor: ['667eea', '764ba2'],
+          avatarImage: null,
+          createdAt: Date.now(),
+        };
+        await env.COSMIC_KV.put(`profile:${cleanUsername}`, JSON.stringify(profile));
         
         // Add to users list
         let usersList = JSON.parse(await env.COSMIC_KV.get('users_list') || '[]');
@@ -108,7 +127,7 @@ export default {
         const token = generateToken();
         await env.COSMIC_KV.put(`session:${token}`, JSON.stringify({ username: cleanUsername }), { expirationTtl: 86400 * 7 });
         
-        return jsonResponse({ success: true, token, username: cleanUsername });
+        return jsonResponse({ success: true, token, username: cleanUsername, profile });
       }
       
       // Login
@@ -172,14 +191,79 @@ export default {
         const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
         const now = Date.now();
         
-        const users = usersList
+        const users = await Promise.all(usersList
           .filter(u => u !== user.username)
-          .map(u => ({
-            username: u,
-            online: presence[u] && (now - presence[u] < 15000),
+          .map(async (u) => {
+            const profileJson = await env.COSMIC_KV.get(`profile:${u}`);
+            const profile = profileJson ? JSON.parse(profileJson) : {};
+            return {
+              username: u,
+              nickname: profile.nickname || u,
+              avatarColor: profile.avatarColor,
+              avatarImage: profile.avatarImage,
+              online: presence[u] && (now - presence[u] < 15000),
+            };
           }));
         
         return jsonResponse({ users });
+      }
+      
+      // Get user profile
+      if (path.startsWith('/api/profile/') && method === 'GET') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const targetUsername = path.split('/api/profile/')[1];
+        const profileJson = await env.COSMIC_KV.get(`profile:${targetUsername}`);
+        
+        if (!profileJson) {
+          return errorResponse('User not found', 404);
+        }
+        
+        const profile = JSON.parse(profileJson);
+        const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        const isOnline = presence[targetUsername] && (Date.now() - presence[targetUsername] < 15000);
+        
+        return jsonResponse({ 
+          profile: {
+            ...profile,
+            online: isOnline,
+            lastSeen: presence[targetUsername] || null
+          }
+        });
+      }
+      
+      // Update own profile
+      if (path === '/api/profile' && method === 'PUT') {
+        const user = await getAuthUser(request, env);
+        if (!user) {
+          return errorResponse('Unauthorized', 401);
+        }
+        
+        const updates = await request.json();
+        const profileJson = await env.COSMIC_KV.get(`profile:${user.username}`);
+        const profile = profileJson ? JSON.parse(profileJson) : {
+          username: user.username,
+          createdAt: Date.now(),
+        };
+        
+        // Update allowed fields
+        if (updates.nickname !== undefined) profile.nickname = updates.nickname.slice(0, 50);
+        if (updates.status !== undefined) profile.status = updates.status.slice(0, 100);
+        if (updates.avatarColor !== undefined) profile.avatarColor = updates.avatarColor;
+        if (updates.avatarImage !== undefined) {
+          // Check size (roughly 15MB in base64)
+          if (updates.avatarImage && updates.avatarImage.length > 20000000) {
+            return errorResponse('Avatar image too large (max 15MB)');
+          }
+          profile.avatarImage = updates.avatarImage;
+        }
+        
+        await env.COSMIC_KV.put(`profile:${user.username}`, JSON.stringify(profile));
+        
+        return jsonResponse({ success: true, profile });
       }
       
       // ==================== PRESENCE ROUTES ====================
