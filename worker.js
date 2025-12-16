@@ -263,6 +263,11 @@ export default {
         
         await env.COSMIC_KV.put(`profile:${user.username}`, JSON.stringify(profile));
         
+        // Track profile update for sync
+        const profileUpdates = JSON.parse(await env.COSMIC_KV.get('profile_updates') || '{}');
+        profileUpdates[user.username] = Date.now();
+        await env.COSMIC_KV.put('profile_updates', JSON.stringify(profileUpdates));
+        
         return jsonResponse({ success: true, profile });
       }
       
@@ -446,18 +451,34 @@ export default {
         const chatWith = url.searchParams.get('with');
         
         let newMessages = [];
+        let readUpdates = [];
         
         if (chatWith) {
           const chatId = [user.username, chatWith].sort().join('_');
           const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
           newMessages = messages.filter(m => m.timestamp > since);
+          
+          // Get read status updates for sent messages
+          readUpdates = messages.filter(m => m.from === user.username && m.read).map(m => m.id);
         }
         
         const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
         
+        // Get profile updates since last sync
+        const profileUpdates = JSON.parse(await env.COSMIC_KV.get('profile_updates') || '{}');
+        const changedProfiles = {};
+        for (const username in profileUpdates) {
+          if (profileUpdates[username] > since) {
+            const p = await env.COSMIC_KV.get(`profile:${username}`);
+            if (p) changedProfiles[username] = JSON.parse(p);
+          }
+        }
+        
         return jsonResponse({ 
           messages: newMessages,
+          readUpdates,
           presence,
+          profileUpdates: changedProfiles,
           timestamp: Date.now()
         });
       }
