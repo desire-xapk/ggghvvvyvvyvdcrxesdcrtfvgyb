@@ -254,9 +254,9 @@ export default {
         if (updates.status !== undefined) profile.status = updates.status.slice(0, 100);
         if (updates.avatarColor !== undefined) profile.avatarColor = updates.avatarColor;
         if (updates.avatarImage !== undefined) {
-          // Check size (roughly 15MB in base64)
-          if (updates.avatarImage && updates.avatarImage.length > 20000000) {
-            return errorResponse('Avatar image too large (max 15MB)');
+          // Check size (roughly 5MB in base64)
+          if (updates.avatarImage && updates.avatarImage.length > 7000000) {
+            return errorResponse('Avatar image too large (max 5MB)');
           }
           profile.avatarImage = updates.avatarImage;
         }
@@ -387,19 +387,14 @@ export default {
         
         const chatList = JSON.parse(await env.COSMIC_KV.get(`chatlist:${user.username}`) || '[]');
         const presence = JSON.parse(await env.COSMIC_KV.get('presence') || '{}');
+        const unreadCounts = JSON.parse(await env.COSMIC_KV.get(`unread:${user.username}`) || '{}');
         const now = Date.now();
         
-        // Add online status and count unread
-        const chatsWithStatus = await Promise.all(chatList.map(async (chat) => {
-          const chatId = [user.username, chat.user].sort().join('_');
-          const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
-          const unread = messages.filter(m => m.to === user.username && !m.read).length;
-          
-          return {
-            ...chat,
-            online: presence[chat.user] && (now - presence[chat.user] < 15000),
-            unread,
-          };
+        // Add online status - unread counts stored separately for efficiency
+        const chatsWithStatus = chatList.map(chat => ({
+          ...chat,
+          online: presence[chat.user] && (now - presence[chat.user] < 20000),
+          unread: unreadCounts[chat.user] || 0,
         }));
         
         return jsonResponse({ chats: chatsWithStatus });
@@ -416,13 +411,24 @@ export default {
         const chatId = [user.username, otherUser].sort().join('_');
         const messages = JSON.parse(await env.COSMIC_KV.get(`chat:${chatId}`) || '[]');
         
+        let updated = false;
         messages.forEach(m => {
-          if (m.to === user.username) {
+          if (m.to === user.username && !m.read) {
             m.read = true;
+            updated = true;
           }
         });
         
-        await env.COSMIC_KV.put(`chat:${chatId}`, JSON.stringify(messages));
+        if (updated) {
+          await env.COSMIC_KV.put(`chat:${chatId}`, JSON.stringify(messages));
+        }
+        
+        // Clear unread count
+        const unreadCounts = JSON.parse(await env.COSMIC_KV.get(`unread:${user.username}`) || '{}');
+        if (unreadCounts[otherUser]) {
+          delete unreadCounts[otherUser];
+          await env.COSMIC_KV.put(`unread:${user.username}`, JSON.stringify(unreadCounts));
+        }
         
         return jsonResponse({ success: true });
       }
@@ -535,4 +541,11 @@ async function updateChatList(env, username, otherUser, message) {
   }
   
   await env.COSMIC_KV.put(`chatlist:${username}`, JSON.stringify(chatList));
+  
+  // Update unread count for recipient (not sender)
+  if (message.to === username) {
+    const unreadCounts = JSON.parse(await env.COSMIC_KV.get(`unread:${username}`) || '{}');
+    unreadCounts[otherUser] = (unreadCounts[otherUser] || 0) + 1;
+    await env.COSMIC_KV.put(`unread:${username}`, JSON.stringify(unreadCounts));
+  }
 }
