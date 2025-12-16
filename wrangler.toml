@@ -7,7 +7,7 @@ compatibility_date = "2024-01-01"
 # Then paste the id below
 [[kv_namespaces]]
 binding = "COSMIC_KV"
-id = "YOUR_KV_NAMESPACE_ID_HERE"
+id = "e61a1056ced3415b825c843e194a68a9"
 
 # For local development
 # Run: wrangler kv:namespace create "COSMIC_KV" --preview
